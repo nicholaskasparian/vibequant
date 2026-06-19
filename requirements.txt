@@ -1,0 +1,22 @@
+# AlphaScout — Python dependencies
+# Install: pip install -r requirements.txt
+
+# Core data & numerics
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+
+# Market data (backtest)
+yfinance>=0.2.40
+
+# ML — GPU-accelerated
+torch>=2.0                   # CUDA auto-detected at runtime
+xgboost>=2.0                 # device='cuda' requires XGBoost >= 2.0
+scikit-learn>=1.3            # StandardScaler for LSTM features
+
+# Live trading
+alpaca-py>=0.20              # Alpaca trading + data API
+schedule>=1.2                # daily job scheduler
+
+# Visualisation (backtest charts)
+matplotlib>=3.7
