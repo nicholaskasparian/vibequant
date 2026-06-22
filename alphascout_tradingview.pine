@@ -35,6 +35,8 @@ kfBearSoft    = input.float(0.0, "Regime soft-bear velocity", step=0.0001)
 ouWindow      = input.int(60, "OU fit window", minval=10)
 ouEntryZ      = input.float(-1.5, "OU entry z", step=0.1)
 ouExitZ       = input.float(1.0, "OU exit z", step=0.1)
+ouScoreMinZ   = input.float(-3.5, "OU score min z", step=0.1)
+ouScoreMaxZ   = input.float(1.5, "OU score max z", step=0.1)
 
 // ----- Half-Kelly params -----
 kellyWindow   = input.int(60, "Kelly window", minval=10)
@@ -47,6 +49,8 @@ volLtWindow   = input.int(252, "Long-run vol window", minval=30)
 // ----- Sharpe momentum + confirmations -----
 momWindow     = input.int(20, "Sharpe momentum window", minval=5)
 volRatioLen   = input.int(20, "Volume ratio window", minval=5)
+sharpeClampLo = input.float(-3.0, "Sharpe clamp low", step=0.1)
+sharpeClampHi = input.float(10.0, "Sharpe clamp high", step=0.1)
 sqrt252       = math.sqrt(252.0)
 
 // =============================================================================
@@ -100,7 +104,7 @@ if bar_index > ouWindow
     float sy = 0.0
     float sxx = 0.0
     float sxy = 0.0
-    for i = ouWindow to 1
+    for i = 1 to ouWindow
         x = residual[i]
         y = residual[i - 1]
         sx += x
@@ -112,7 +116,7 @@ if bar_index > ouWindow
     b = math.abs(denom) > 1e-12 ? (n * sxy - sx * sy) / denom : 0.0
     a = (sy - b * sx) / n
     float epsVar = 0.0
-    for i = ouWindow to 1
+    for i = 1 to ouWindow
         x = residual[i]
         y = residual[i - 1]
         e = y - (a + b * x)
@@ -149,7 +153,7 @@ volScalar = volRatio >= 2.0 ? 0.50 : volRatio >= 1.5 ? 0.75 : volRatio < 0.75 ? 
 retN = close / close[momWindow] - 1.0
 volN = ta.stdev(ret, momWindow) * sqrt252
 sharpeM = (retN * 252.0 / momWindow) / (volN + 1e-9)
-sharpeM := math.max(-3.0, math.min(10.0, sharpeM))
+sharpeM := math.max(sharpeClampLo, math.min(sharpeClampHi, sharpeM))
 
 // Confirmations
 [macdLine, macdSignal, _] = ta.macd(close, 12, 26, 9)
@@ -166,7 +170,7 @@ score = 0
 score += xVel > kfVelThresh ? 1 : 0
 score += close > kfPrice ? 1 : 0
 score += volScalar >= 0.75 ? 1 : 0
-score += (ouZ > -3.5 and ouZ < 1.5) ? 1 : 0
+score += (ouZ > ouScoreMinZ and ouZ < ouScoreMaxZ) ? 1 : 0
 score += (ouZ < ouEntryZ or (ouZ > 0.0 and ouZ < ouExitZ)) ? 1 : 0
 score += sharpeM > 0.5 ? 1 : 0
 score += sharpeM > 1.0 ? 1 : 0
