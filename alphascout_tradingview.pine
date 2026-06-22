@@ -1,0 +1,204 @@
+//@version=5
+strategy("AlphaScout (Pine v5) - Kalman/OU/Kelly", overlay=true, initial_capital=100000, pyramiding=0, commission_type=strategy.commission.percent, commission_value=0.10, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// =============================================================================
+// AlphaScout TradingView Port (single-instrument)
+// Core components:
+// 1) 2-state Kalman filter on log-price (level + velocity)
+// 2) OU residual z-score from rolling OLS
+// 3) Half-Kelly position sizing from rolling return moments
+// 4) EWMA-GARCH style volatility regime scalar
+// 5) Sharpe momentum (20-bar risk-adjusted momentum)
+// 6) Composite scoring (Kalman + OU + momentum + MACD + volume)
+//
+// Simplifications vs Python:
+// - No XGBoost/LSTM/Adaptive-Kalman (not practical in Pine)
+// - Regime filter uses Kalman velocity mean
+// - Single-chart/single-instrument workflow
+// =============================================================================
+
+// ----- General controls -----
+enableStrategyOrders = input.bool(true, "Enable Strategy Orders", tooltip="Turn OFF to use this as signal generator only.")
+entryScoreMin        = input.int(5, "Entry Score Min", minval=0, maxval=9)
+exitScoreMax         = input.int(2, "Exit Score Max", minval=0, maxval=9)
+maxPosFrac           = input.float(0.25, "Max Position Fraction", minval=0.01, maxval=1.0, step=0.01)
+
+// ----- Kalman filter params -----
+kfObsNoise    = input.float(1.0, "Kalman R (obs noise)", minval=1e-6, step=0.01)
+kfProcNoise   = input.float(0.04, "Kalman Q base (proc noise)", minval=1e-6, step=0.001)
+kfVelThresh   = input.float(0.0002, "Kalman velocity threshold", step=0.0001)
+kfRegimeLen   = input.int(10, "Regime MA length (velocity)", minval=2)
+kfBearHard    = input.float(-0.0010, "Regime hard-bear velocity", step=0.0001)
+kfBearSoft    = input.float(0.0, "Regime soft-bear velocity", step=0.0001)
+
+// ----- OU params -----
+ouWindow      = input.int(60, "OU fit window", minval=10)
+ouEntryZ      = input.float(-1.5, "OU entry z", step=0.1)
+ouExitZ       = input.float(1.0, "OU exit z", step=0.1)
+ouScoreMinZ   = input.float(-3.5, "OU score min z", step=0.1)
+ouScoreMaxZ   = input.float(1.5, "OU score max z", step=0.1)
+
+// ----- Half-Kelly params -----
+kellyWindow   = input.int(60, "Kelly window", minval=10)
+kellyFraction = input.float(0.5, "Kelly fraction (0.5 = half-Kelly)", minval=0.0, maxval=1.0, step=0.05)
+
+// ----- Volatility regime params -----
+ewmaLambda    = input.float(0.94, "EWMA lambda", minval=0.80, maxval=0.999, step=0.001)
+volLtWindow   = input.int(252, "Long-run vol window", minval=30)
+
+// ----- Sharpe momentum + confirmations -----
+momWindow     = input.int(20, "Sharpe momentum window", minval=5)
+volRatioLen   = input.int(20, "Volume ratio window", minval=5)
+sharpeClampLo = input.float(-3.0, "Sharpe clamp low", step=0.1)
+sharpeClampHi = input.float(10.0, "Sharpe clamp high", step=0.1)
+sqrt252       = math.sqrt(252.0)
+
+// =============================================================================
+// 1) Kalman Filter (2-state: level + velocity) on log-price
+// =============================================================================
+logPrice = math.log(close)
+qL = kfProcNoise * 0.1
+qV = kfProcNoise
+
+var float xLevel = na
+var float xVel   = na
+var float p00    = na
+var float p01    = na
+var float p10    = na
+var float p11    = na
+
+if barstate.isfirst
+    xLevel := logPrice
+    xVel   := 0.0
+    p00    := 1e4
+    p01    := 0.0
+    p10    := 0.0
+    p11    := 1e4
+else
+    x0p = xLevel + xVel
+    x1p = xVel
+    p00p = p00 + p01 + p10 + p11 + qL
+    p01p = p01 + p11
+    p10p = p10 + p11
+    p11p = p11 + qV
+    innov = logPrice - x0p
+    s = p00p + kfObsNoise
+    k0 = p00p / s
+    k1 = p10p / s
+    xLevel := x0p + k0 * innov
+    xVel   := x1p + k1 * innov
+    p00    := (1.0 - k0) * p00p
+    p01    := (1.0 - k0) * p01p
+    p10    := p10p - k1 * p00p
+    p11    := p11p - k1 * p01p
+
+kfPrice = math.exp(xLevel)
+residual = logPrice - xLevel
+
+// =============================================================================
+// 2) Ornstein-Uhlenbeck z-score from rolling residual regression
+// =============================================================================
+float ouZ = na
+if bar_index >= ouWindow
+    float sx = 0.0
+    float sy = 0.0
+    float sxx = 0.0
+    float sxy = 0.0
+    for i = 1 to ouWindow
+        x = residual[i]
+        y = residual[i - 1]
+        sx += x
+        sy += y
+        sxx += x * x
+        sxy += x * y
+    n = ouWindow
+    denom = n * sxx - sx * sx
+    b = math.abs(denom) > 1e-12 ? (n * sxy - sx * sy) / denom : 0.0
+    a = (sy - b * sx) / n
+    float epsVar = 0.0
+    for i = 1 to ouWindow
+        x = residual[i]
+        y = residual[i - 1]
+        e = y - (a + b * x)
+        epsVar += e * e
+    epsVar := epsVar / n
+    theta = math.max(1.0 - b, 1e-6)
+    mu = math.abs(1.0 - b) > 1e-9 ? a / (1.0 - b) : ta.sma(residual, ouWindow)
+    sigma = math.sqrt(math.max(epsVar, 1e-12))
+    sigmaEq = sigma / math.sqrt(math.max(2.0 * theta, 1e-9))
+    ouZ := (residual - mu) / (sigmaEq + 1e-9)
+
+// =============================================================================
+// 3) Half-Kelly position sizing
+// =============================================================================
+ret = close / close[1] - 1.0
+muAnn = ta.sma(ret, kellyWindow) * 252.0
+varAnn = ta.variance(ret, kellyWindow) * 252.0
+kellyRaw = kellyFraction * muAnn / math.max(varAnn, 1e-9)
+kellyFrac = math.max(0.0, math.min(kellyRaw, maxPosFrac))
+
+// =============================================================================
+// 4) EWMA-GARCH style volatility regime scalar
+// =============================================================================
+var float ewmaVar = na
+ewmaVar := na(ewmaVar[1]) ? ret * ret : ewmaLambda * ewmaVar[1] + (1.0 - ewmaLambda) * ret * ret
+volEwma = math.sqrt(math.max(ewmaVar, 0.0)) * sqrt252
+volLt = ta.stdev(ret, volLtWindow) * sqrt252
+volRatio = volEwma / (volLt + 1e-9)
+volScalar = volRatio >= 2.0 ? 0.50 : volRatio >= 1.5 ? 0.75 : volRatio < 0.75 ? 1.25 : 1.00
+
+// =============================================================================
+// 5) Sharpe momentum (single-instrument adaptation of cross-sectional signal)
+// =============================================================================
+retN = close / close[momWindow] - 1.0
+volN = ta.stdev(ret, momWindow) * sqrt252
+sharpeM = (retN * 252.0 / momWindow) / (volN + 1e-9)
+sharpeM := math.max(sharpeClampLo, math.min(sharpeClampHi, sharpeM))
+
+// Confirmations
+[macdLine, macdSignal, _] = ta.macd(close, 12, 26, 9)
+volRatio20 = volume / math.max(ta.sma(volume, volRatioLen), 1.0)
+
+// Regime from Kalman velocity mean (LSTM replacement)
+velMean = ta.sma(xVel, kfRegimeLen)
+regimeScalar = velMean < kfBearHard ? 0.0 : velMean < kfBearSoft ? 0.5 : 1.0
+
+// =============================================================================
+// 6) Composite AlphaScout score (0..9)
+// =============================================================================
+score = 0
+score += xVel > kfVelThresh ? 1 : 0
+score += close > kfPrice ? 1 : 0
+score += volScalar >= 0.75 ? 1 : 0
+// Intentional two-part OU scoring: one "safe zone" point + one "entry/continuation" point.
+score += (ouZ > ouScoreMinZ and ouZ < ouScoreMaxZ) ? 1 : 0
+score += (ouZ < ouEntryZ or (ouZ > 0.0 and ouZ < ouExitZ)) ? 1 : 0
+score += sharpeM > 0.5 ? 1 : 0
+score += sharpeM > 1.0 ? 1 : 0
+score += macdLine > macdSignal ? 1 : 0
+score += volRatio20 > 1.1 ? 1 : 0
+
+targetFrac = math.min(kellyFrac * volScalar * regimeScalar, maxPosFrac)
+qtyPct = targetFrac * 100.0
+
+longSignal = score >= entryScoreMin and regimeScalar > 0 and not na(ouZ) and not na(qtyPct) and qtyPct > 0
+exitSignal = score <= exitScoreMax or regimeScalar == 0.0
+
+if enableStrategyOrders
+    if longSignal and strategy.position_size <= 0
+        strategy.entry("Long", strategy.long, qty=qtyPct)
+    if strategy.position_size > 0 and exitSignal
+        strategy.close("Long")
+
+// Alerts (work in both signal-only and strategy modes)
+alertcondition(longSignal, title="AlphaScout Long", message="AlphaScout long signal on {{ticker}}")
+alertcondition(exitSignal, title="AlphaScout Exit", message="AlphaScout exit signal on {{ticker}}")
+
+// Visuals
+plot(kfPrice, "Kalman Level", color=color.orange, linewidth=2)
+plotshape(longSignal, title="Long Marker", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny, text="A+")
+plotshape(exitSignal, title="Exit Marker", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny, text="AX")
+plot(score, "Composite Score", color=color.new(color.aqua, 0), linewidth=1, style=plot.style_stepline, display=display.data_window)
+plot(ouZ, "OU Z-Score", color=color.new(color.purple, 0), linewidth=2, scale=scale.left)
+hline(ouEntryZ, "OU Entry Z", color=color.new(color.green, 40), linestyle=hline.style_dashed)
+hline(ouExitZ, "OU Exit Z", color=color.new(color.red, 40), linestyle=hline.style_dashed)

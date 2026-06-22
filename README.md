@@ -10,6 +10,7 @@
 alphascout_backtest.py   Pure-math strategy + backtester
 alphascout_ml.py         GPU ML layer (XGBoost + LSTM + Adaptive Kalman)
 alphascout_live.py       Alpaca paper/live trading with ML signals
+alphascout_tradingview.pine  Pine Script v5 single-instrument strategy
 ```
 
 All three files are standalone and share no state at rest. The live script
