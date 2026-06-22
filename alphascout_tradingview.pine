@@ -99,7 +99,7 @@ residual = logPrice - xLevel
 // 2) Ornstein-Uhlenbeck z-score from rolling residual regression
 // =============================================================================
 float ouZ = na
-if bar_index > ouWindow
+if bar_index >= ouWindow
     float sx = 0.0
     float sy = 0.0
     float sxx = 0.0
@@ -123,7 +123,7 @@ if bar_index > ouWindow
         epsVar += e * e
     epsVar := epsVar / n
     theta = math.max(1.0 - b, 1e-6)
-    mu = math.abs(1.0 - b) > 1e-9 ? a / (1.0 - b) : ta.sma(residual, ouWindow + 1)
+    mu = math.abs(1.0 - b) > 1e-9 ? a / (1.0 - b) : ta.sma(residual, ouWindow)
     sigma = math.sqrt(math.max(epsVar, 1e-12))
     sigmaEq = sigma / math.sqrt(math.max(2.0 * theta, 1e-9))
     ouZ := (residual - mu) / (sigmaEq + 1e-9)
@@ -170,6 +170,7 @@ score = 0
 score += xVel > kfVelThresh ? 1 : 0
 score += close > kfPrice ? 1 : 0
 score += volScalar >= 0.75 ? 1 : 0
+// Intentional two-part OU scoring: one "safe zone" point + one "entry/continuation" point.
 score += (ouZ > ouScoreMinZ and ouZ < ouScoreMaxZ) ? 1 : 0
 score += (ouZ < ouEntryZ or (ouZ > 0.0 and ouZ < ouExitZ)) ? 1 : 0
 score += sharpeM > 0.5 ? 1 : 0
@@ -197,7 +198,7 @@ alertcondition(exitSignal, title="AlphaScout Exit", message="AlphaScout exit sig
 plot(kfPrice, "Kalman Level", color=color.orange, linewidth=2)
 plotshape(longSignal, title="Long Marker", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.tiny, text="A+")
 plotshape(exitSignal, title="Exit Marker", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.tiny, text="AX")
-plot(score, "Composite Score", color=color.new(color.aqua, 0), linewidth=1, style=plot.style_stepline)
+plot(score, "Composite Score", color=color.new(color.aqua, 0), linewidth=1, style=plot.style_stepline, display=display.data_window)
 plot(ouZ, "OU Z-Score", color=color.new(color.purple, 0), linewidth=2, scale=scale.left)
 hline(ouEntryZ, "OU Entry Z", color=color.new(color.green, 40), linestyle=hline.style_dashed)
 hline(ouExitZ, "OU Exit Z", color=color.new(color.red, 40), linestyle=hline.style_dashed)
